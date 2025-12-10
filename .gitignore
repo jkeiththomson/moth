@@ -1,0 +1,87 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.python-version
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Byte-compiled / optimized / DLL files
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+coverage/
+.cache/
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Local data and temp files
+*.sqlite3
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# PyCharm / JetBrains
+# -------------------------
+# Uncomment *only* if you want to ignore all IDE configs:
+#.idea/
+
+# Recommended approach:
+# Keep run configs and inspections out of git,
+# but allow project settings like environment & code styles.
+
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.local.xml
+.idea/usage.statistics.xml
+.idea/sonarlint/
+
+# Optional: Ignore misc metadata
+.idea/modules.xml
+.idea/vcs.xml
+
+# -------------------------
+# macOS
+# -------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# -------------------------
+# PyCharm cache directories
+# -------------------------
+# (These are safe to ignore)
+.idea/**/libraries/
+.idea/**/caches/
+.idea/**/dictionaries/
+.idea/**/options/
