@@ -1,0 +1,9 @@
+Report for: data/sample_transactions.csv
+Categories file: data/category_rules.csv
+Total rows: 5
+
+Category, Count, Total Amount
+Fuel, 1, -32.10
+Groceries, 2, -105.90
+Income, 1, 150.00
+Subscriptions, 1, -15.99
