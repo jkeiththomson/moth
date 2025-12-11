@@ -17,7 +17,7 @@ def extract(input_pdf: Path, output_csv: Path) -> None:
     Expected behavior (later, when implemented):
 
     - Read the bank/credit-card statement PDF.
-    - Parse every transaction (date, description, amount).
+    - Parse every transaction (statement_date, date, description, amount).
     - Write a flat CSV file with one transaction per row.
     - Count deposits and withdrawals and sum their amounts.
 
@@ -26,7 +26,9 @@ def extract(input_pdf: Path, output_csv: Path) -> None:
     print("[EXTRACT] stub running...")
     print(f"[EXTRACT] Would read PDF: {input_pdf}")
     print(f"[EXTRACT] Would write CSV: {output_csv}")
-    print("[EXTRACT] Would also count deposits / withdrawals and sum amounts.")
+    print("[EXTRACT] Would also compute deposits/withdrawals and totals.")
+    print("[EXTRACT] CSV schema would include: "
+          "statement_date, date, description, amount, category")
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,7 @@ def _save_category_map(categories_file: Path, mapping: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Categorize: real persistent category system
+# Categorize: persistent category system with statement_date support
 # ---------------------------------------------------------------------------
 
 
@@ -95,6 +97,10 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
         the category is filled in from the rule.
       * If there is no rule and no category, the category is left blank.
 
+    Required columns in ``input_csv``:
+
+        statement_date, date, description, amount
+
     Effect:
     - Category assignments survive quitting and restarting the app.
     - Editing categories directly in the CSV and re-running ``categorize``
@@ -105,59 +111,62 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
         print(f"[CATEGORIZE] ERROR: transactions CSV not found: {input_csv}")
         return
 
-    category_map = _load_category_map(categories_file)
-
     with input_csv.open(newline="", encoding="utf-8") as f_in:
         reader = csv.DictReader(f_in)
         fieldnames = reader.fieldnames or []
-        if "description" not in fieldnames:
-            print(
-                "[CATEGORIZE] ERROR: input CSV must have a 'description' column."
-            )
-            return
-        if "amount" not in fieldnames:
-            print(
-                "[CATEGORIZE] ERROR: input CSV must have an 'amount' column."
-            )
-            return
-        if "category" not in fieldnames:
-            fieldnames.append("category")
+        rows = list(reader)
 
-        rows: list[dict[str, str]] = []
-        auto_assigned = 0
-        already_categorized = 0
-        uncategorized = 0
+    required_cols = ["statement_date", "date", "description", "amount"]
+    missing = [c for c in required_cols if c not in fieldnames]
 
-        for row in reader:
-            desc = (row.get("description") or "").strip()
-            cat = (row.get("category") or "").strip()
+    if missing:
+        print(
+            "[CATEGORIZE] ERROR: input CSV must have columns: "
+            + ", ".join(required_cols)
+        )
+        print("[CATEGORIZE] Missing:", ", ".join(missing))
+        return
 
-            if not desc:
-                rows.append(row)
-                continue
+    if "category" not in fieldnames:
+        fieldnames.append("category")
 
-            if cat:
-                # Row already has a category; learn or update the rule.
-                if category_map.get(desc) != cat:
-                    category_map[desc] = cat
-                already_categorized += 1
+    category_map = _load_category_map(categories_file)
+
+    auto_assigned = 0
+    already_categorized = 0
+    uncategorized = 0
+
+    updated_rows: list[dict[str, str]] = []
+
+    for row in rows:
+        desc = (row.get("description") or "").strip()
+        cat = (row.get("category") or "").strip()
+
+        if not desc:
+            updated_rows.append(row)
+            continue
+
+        if cat:
+            # Row already has a category; learn or update the rule.
+            if category_map.get(desc) != cat:
+                category_map[desc] = cat
+            already_categorized += 1
+        else:
+            # No category yet; try to apply a rule.
+            rule_cat = category_map.get(desc)
+            if rule_cat:
+                row["category"] = rule_cat
+                auto_assigned += 1
             else:
-                # No category yet; try to apply a rule.
-                rule_cat = category_map.get(desc)
-                if rule_cat:
-                    row["category"] = rule_cat
-                    auto_assigned += 1
-                else:
-                    # No rule: leave blank for now.
-                    uncategorized += 1
+                uncategorized += 1
 
-            rows.append(row)
+        updated_rows.append(row)
 
     # Write updated transactions back to the same CSV.
     with input_csv.open("w", newline="", encoding="utf-8") as f_out:
         writer = csv.DictWriter(f_out, fieldnames=fieldnames)
         writer.writeheader()
-        for row in rows:
+        for row in updated_rows:
             writer.writerow(row)
 
     # Persist updated category rules.
@@ -185,6 +194,8 @@ def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
         * number of transactions
         * total amount (sum of 'amount')
     - Writes a plain-text report to ``report_file`` summarizing these totals.
+
+    ``statement_date`` is preserved in the CSV but not yet used for grouping.
     """
 
     if not input_csv.exists():

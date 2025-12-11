@@ -1,7 +1,7 @@
 """
 moth package.
 
-Skeleton pipeline with three subcommands:
+Skeleton statement pipeline with three commands:
 - extract
 - categorize
 - export
