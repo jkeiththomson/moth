@@ -1,8 +1,8 @@
-"""
-moth package.
+"""moth – statement pipeline prototype.
 
-Skeleton statement pipeline with three commands:
+Commands:
 - extract
 - categorize
 - export
+- check
 """

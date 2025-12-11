@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -38,9 +39,10 @@ def extract(input_pdf: Path, output_csv: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _load_group_category_master() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """
-    Load and validate the master group/category mapping from data/categories.csv.
+def _load_group_category_master(
+    master_path: Path,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Load and validate the master group/category mapping.
 
     Rules enforced:
 
@@ -55,10 +57,6 @@ def _load_group_category_master() -> tuple[dict[str, set[str]], dict[str, set[st
         group_to_categories: {group -> set of categories}
         category_to_groups: {category -> set of groups}
     """
-    from pathlib import Path as _Path
-    import csv as _csv
-
-    master_path = _Path(__file__).resolve().parent.parent / "data" / "categories.csv"
 
     group_to_categories: dict[str, set[str]] = {}
     category_to_groups: dict[str, set[str]] = {}
@@ -70,7 +68,7 @@ def _load_group_category_master() -> tuple[dict[str, set[str]], dict[str, set[st
     seen_pairs: set[tuple[str, str]] = set()
 
     with master_path.open(newline="", encoding="utf-8") as f:
-        reader = _csv.DictReader(f)
+        reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
 
         group_field = None
@@ -84,7 +82,7 @@ def _load_group_category_master() -> tuple[dict[str, set[str]], dict[str, set[st
 
         if not group_field or not category_field:
             print(
-                "[GROUPS] ERROR: categories.csv must have 'group' and 'category' columns."
+                "[GROUPS] ERROR: master categories file must have 'group' and 'category' columns."
             )
             return group_to_categories, category_to_groups
 
@@ -134,8 +132,7 @@ def _load_group_category_master() -> tuple[dict[str, set[str]], dict[str, set[st
 def _load_category_rules(
     categories_file: Path,
 ) -> dict[str, tuple[str, str]]:
-    """
-    Load a description→(group, category) mapping from a CSV rules file, if it exists.
+    """Load a description→(group, category) mapping from a CSV rules file.
 
     Expected format:
 
@@ -201,9 +198,12 @@ def _save_category_rules(
 # ---------------------------------------------------------------------------
 
 
-def categorize(input_csv: Path, categories_file: Path) -> None:
-    """
-    Assign (group, category) to each transaction and persist description-based rules.
+def categorize(
+    input_csv: Path,
+    categories_file: Path,
+    master_categories_file: Path,
+) -> None:
+    """Assign (group, category) to each transaction and persist description-based rules.
 
     Behavior:
 
@@ -252,7 +252,9 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
         return
 
     # Load master (group, category) universe (read-only).
-    group_to_categories, category_to_groups = _load_group_category_master()
+    group_to_categories, category_to_groups = _load_group_category_master(
+        master_categories_file
+    )
 
     # Load description → (group, category) rules.
     rules = _load_category_rules(categories_file)
@@ -340,6 +342,144 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Check: validate without modifying
+# ---------------------------------------------------------------------------
+
+
+def check(
+    input_csv: Path,
+    categories_file: Path,
+    master_categories_file: Path,
+) -> None:
+    """Validate transactions, master categories, and rules WITHOUT modifying anything.
+
+    This performs:
+
+    - Schema check on the transactions CSV.
+    - Row-level (group, category) checks:
+        * group with no category
+        * category with no group
+        * (group, category) not found in master categories
+    - Consistency between transactions and description→(group, category) rules:
+        * If a rule exists and row has a conflicting (group, category), warn.
+        * If a row has a full (group, category) but no rule yet, note it.
+        * If a row is blank but a rule exists, note that it *could* be auto-assigned.
+
+    It does NOT write or update any files.
+    """
+    if not input_csv.exists():
+        print(f"[CHECK] ERROR: transactions CSV not found: {input_csv}")
+        return
+
+    with input_csv.open(newline="", encoding="utf-8") as f_in:
+        reader = csv.DictReader(f_in)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    required_cols = [
+        "statement_date",
+        "date",
+        "description",
+        "amount",
+        "group",
+        "category",
+    ]
+    missing = [c for c in required_cols if c not in fieldnames]
+
+    if missing:
+        print(
+            "[CHECK] ERROR: input CSV must have columns: "
+            + ", ".join(required_cols)
+        )
+        print("[CHECK] Missing:", ", ".join(missing))
+        return
+
+    group_to_categories, category_to_groups = _load_group_category_master(
+        master_categories_file
+    )
+    rules = _load_category_rules(categories_file)
+
+    total_rows = 0
+    warn_no_group = 0
+    warn_no_category = 0
+    warn_invalid_pair = 0
+    warn_rule_conflict = 0
+    warn_rule_missing_for_used = 0
+    info_rule_could_apply = 0
+
+    for idx, row in enumerate(rows, start=1):
+        total_rows += 1
+        desc = (row.get("description") or "").strip()
+        grp = (row.get("group") or "").strip()
+        cat = (row.get("category") or "").strip()
+
+        if cat and not grp:
+            warn_no_group += 1
+            print(
+                f"[CHECK] Warning: row {idx} has category={cat!r} "
+                "but no group."
+            )
+
+        if grp and not cat:
+            warn_no_category += 1
+            print(
+                f"[CHECK] Warning: row {idx} has group={grp!r} "
+                "but no category."
+            )
+
+        if grp and cat:
+            valid_cats = group_to_categories.get(grp, set())
+            if cat not in valid_cats:
+                warn_invalid_pair += 1
+                print(
+                    f"[CHECK] Warning: row {idx} has (group, category)="
+                    f"({grp!r}, {cat!r}) which does not exist in master categories."
+                )
+
+        # Cross-check with rules
+        rule_pair = rules.get(desc)
+
+        if grp and cat:
+            if rule_pair is None:
+                # We have a fully specified pair but no rule yet
+                warn_rule_missing_for_used += 1
+                print(
+                    f"[CHECK] Note: row {idx} has (group, category)=({grp!r}, {cat!r}) "
+                    f"for description={desc!r}, but there is no rule yet for this "
+                    "description. categorize() would learn this rule."
+                )
+            else:
+                rule_grp, rule_cat = rule_pair
+                if (grp, cat) != rule_pair:
+                    warn_rule_conflict += 1
+                    print(
+                        f"[CHECK] Warning: row {idx} has (group, category)=({grp!r}, {cat!r}) "
+                        f"but the rules file has ({rule_grp!r}, {rule_cat!r}) "
+                        f"for description={desc!r}."
+                    )
+        else:
+            # No full pair on the row
+            if rule_pair is not None:
+                info_rule_could_apply += 1
+                rule_grp, rule_cat = rule_pair
+                print(
+                    f"[CHECK] Info: row {idx} has description={desc!r} but no full "
+                    "(group, category); rules file would assign "
+                    f"({rule_grp!r}, {rule_cat!r})."
+                )
+
+    print("\\n[CHECK] Summary")
+    print(f"[CHECK] Total rows examined           : {total_rows}")
+    print(f"[CHECK] category without group       : {warn_no_group}")
+    print(f"[CHECK] group without category       : {warn_no_category}")
+    print(f"[CHECK] invalid (group, category)    : {warn_invalid_pair}")
+    print(f"[CHECK] rule mismatches (conflicts)  : {warn_rule_conflict}")
+    print(f"[CHECK] rows with pair but no rule   : {warn_rule_missing_for_used}")
+    print(f"[CHECK] rows where a rule could apply: {info_rule_could_apply}")
+    print(f"[CHECK] Done. No files were modified.")
+
+
+# ---------------------------------------------------------------------------
 # Export: simple summary report (still category-based for now)
 # ---------------------------------------------------------------------------
 
@@ -396,11 +536,11 @@ def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
         f_out.write(f"Report for: {input_csv}\n")
         f_out.write(f"Categories file: {categories_file}\n")
         f_out.write(f"Total rows: {total_rows}\n")
-        f_out.write("\n")
-        f_out.write("Category, Count, Total Amount\n")
+        f_out.write("\\n")
+        f_out.write("Category, Count, Total Amount\\n")
         for category in sorted(totals):
             f_out.write(
-                f"{category}, {counts[category]}, {totals[category]:.2f}\n"
+                f"{category}, {counts[category]}, {totals[category]:.2f}\\n"
             )
 
     print("[EXPORT] Report written to:", report_file)
@@ -413,15 +553,16 @@ def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """
-    Meta function that exposes the three commands:
+    Meta function that exposes the commands:
 
     - extract
     - categorize
     - export
+    - check
     """
     parser = argparse.ArgumentParser(
         prog="moth",
-        description="moth pipeline: extract → categorize → export",
+        description="moth pipeline: extract → categorize → export → check",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -450,6 +591,10 @@ def main(argv: list[str] | None = None) -> None:
         "categories_file",
         help="Path to category rules file (persists across runs).",
     )
+    p_categorize.add_argument(
+        "master_categories_file",
+        help="Path to master (group, category) CSV.",
+    )
 
     # export
     p_export = subparsers.add_parser(
@@ -469,6 +614,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to summary report output file.",
     )
 
+    # check
+    p_check = subparsers.add_parser(
+        "check",
+        help="Validate transactions, master categories, and rules without modifying anything.",
+    )
+    p_check.add_argument(
+        "input_csv",
+        help="Path to transactions CSV to check.",
+    )
+    p_check.add_argument(
+        "categories_file",
+        help="Path to category rules file.",
+    )
+    p_check.add_argument(
+        "master_categories_file",
+        help="Path to master (group, category) CSV.",
+    )
+
     args = parser.parse_args(argv)
     command = args.command
 
@@ -481,12 +644,19 @@ def main(argv: list[str] | None = None) -> None:
         categorize(
             input_csv=Path(args.input_csv),
             categories_file=Path(args.categories_file),
+            master_categories_file=Path(args.master_categories_file),
         )
     elif command == "export":
         export(
             input_csv=Path(args.input_csv),
             categories_file=Path(args.categories_file),
             report_file=Path(args.report_file),
+        )
+    elif command == "check":
+        check(
+            input_csv=Path(args.input_csv),
+            categories_file=Path(args.categories_file),
+            master_categories_file=Path(args.master_categories_file),
         )
     else:
         parser.error(f"Unknown command: {command}")
