@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import csv
+from dataclasses import dataclass
+from enum import Enum
+
 
 from .extractors import extract_chase_activity
 
@@ -136,8 +139,153 @@ def _save_category_rules(categories_file: Path, rules: dict[str, tuple[str, str]
             writer.writerow([desc, grp, cat])
 
 
+
+
+
+class TxStatus(Enum):
+    MANUAL = "manual"
+    AUTO_PENDING = "auto-pending"
+    UNASSIGNED = "unassigned"
+
+
+@dataclass
+class CategoryEntry:
+    id: int
+    group: str
+    name: str
+
+
+def _build_category_entries(group_to_categories: dict[str, set[str]]) -> list[CategoryEntry]:
+    """Derive sorted CategoryEntry list with IDs from master groups/categories."""
+    entries: list[CategoryEntry] = []
+    cat_id = 1
+    for group in sorted(group_to_categories.keys()):
+        cats = sorted(group_to_categories[group])
+        for name in cats:
+            entries.append(CategoryEntry(id=cat_id, group=group, name=name))
+            cat_id += 1
+    return entries
+
+
+def _preview_ui_page(rows: list[dict[str, str]], statuses: list[TxStatus], group_to_categories: dict[str, set[str]], max_rows: int = 10) -> None:
+    """Print a simple one-page UI preview (non-interactive).
+
+    - Top: groups and categories laid out in up to 5 columns, 27 chars wide.
+    - Bottom: first N transactions with color-coded category/group.
+    """
+    if not rows:
+        print("[PREVIEW] No rows to display.")
+        return
+
+    # Build category entries and (group, category) -> id map
+    entries = _build_category_entries(group_to_categories)
+    pair_to_id: dict[tuple[str, str], int] = {
+        (e.group, e.name): e.id for e in entries
+    }
+
+    # --- Top half: categories layout ---
+    MAX_COLS = 5
+    COL_WIDTH = 27
+    MAX_LINES_PER_COL = 12  # arbitrary for preview
+
+    # Build blocks: each group header + its category lines
+    blocks: list[list[str]] = []
+    for group in sorted(group_to_categories.keys()):
+        cats = sorted(group_to_categories[group])
+        if not cats:
+            continue
+        block_lines: list[str] = []
+        block_lines.append(group[:COL_WIDTH].ljust(COL_WIDTH))
+        for cat in cats:
+            cat_id = pair_to_id.get((group, cat), 0)
+            line = f"{cat_id:4d} {cat}" if cat_id else f"     {cat}"
+            block_lines.append(line[:COL_WIDTH].ljust(COL_WIDTH))
+        blocks.append(block_lines)
+
+    # Distribute blocks into columns without splitting a block
+    columns: list[list[str]] = [[] for _ in range(MAX_COLS)]
+    col_idx = 0
+    for block in blocks:
+        if col_idx >= MAX_COLS:
+            break
+        col = columns[col_idx]
+        # If block would overflow this column, move to next column
+        if len(col) + len(block) > MAX_LINES_PER_COL and col:
+            col_idx += 1
+            if col_idx >= MAX_COLS:
+                break
+            col = columns[col_idx]
+        col.extend(block)
+
+    print("[CATEGORIZE PREVIEW] Categories (top half)")
+    # Compute max lines actually used
+    max_lines = max((len(col) for col in columns), default=0)
+    for row_idx in range(max_lines):
+        line_parts = []
+        for col in columns:
+            if row_idx < len(col):
+                line_parts.append(col[row_idx])
+            else:
+                line_parts.append("".ljust(COL_WIDTH))
+        print(" ".join(line_parts))
+
+    # --- Bottom half: transactions preview ---
+    print("\n[CATEGORIZE PREVIEW] Transactions (bottom half)")
+    header = (
+        "Num  Statement   Trans_Date  "
+        "Description                           CatID  Category        Group"
+    )
+    print(header)
+    print("-" * len(header))
+
+    # ANSI colors
+    GREEN = "\x1b[32m"
+    YELLOW = "\x1b[33m"
+    RED = "\x1b[31m"
+    RESET = "\x1b[0m"
+
+    for i, (row, status) in enumerate(zip(rows, statuses), start=1):
+        if i > max_rows:
+            break
+        stmt_date = (row.get("statement_date") or "")[:10]
+        tx_date = (row.get("date") or "")[:10]
+        desc = (row.get("description") or "")[:35]
+        grp = (row.get("group") or "")[:12]
+        cat = (row.get("category") or "")[:12]
+
+        cat_id = pair_to_id.get((grp, cat))
+        cat_id_str = f"{cat_id:4d}" if cat_id is not None else "   -"
+
+        if status == TxStatus.MANUAL:
+            color = GREEN
+        elif status == TxStatus.AUTO_PENDING:
+            color = YELLOW
+        else:
+            color = RED
+
+        # Only color the CatID/Category/Group portion
+        prefix = f"{i:4d}  {stmt_date:10s} {tx_date:10s} {desc:35s} "
+        cat_part = f"{color}{cat_id_str}  {cat:12s} {grp:12s}{RESET}"
+        print(prefix + cat_part)
+    print("[CATEGORIZE PREVIEW] (showing up to", max_rows, "rows)")
+
 def categorize(input_csv: Path, categories_file: Path, master_categories_file: Path) -> None:
-    """Assign (group, category) pairs and update rules."""
+    """Assign (group, category) pairs and update description-based rules.
+
+    Mental model:
+
+    - The transactions CSV is the truth for this statement.
+    - master_categories.csv defines the allowed (group, category) universe.
+    - category_rules.csv is a cache of description -> (group, category) shortcuts.
+
+    Rules:
+
+    - We *never* create or update a rule for an invalid (group, category) pair.
+    - If a row's (group, category) conflicts with an existing rule for that
+      description, we WARN and leave the existing rule unchanged.
+    - If a row has a valid (group, category) and no rule yet, we learn a new rule.
+    - If a row has no (group, category) and we have a rule, we auto-assign it.
+    """
     if not input_csv.exists():
         print(f"[CATEGORIZE] ERROR: transactions CSV not found: {input_csv}")
         return
@@ -154,69 +302,141 @@ def categorize(input_csv: Path, categories_file: Path, master_categories_file: P
         print("[CATEGORIZE] Missing:", ", ".join(missing))
         return
 
+    # Load master (group, category) universe (read-only).
     group_to_categories, category_to_groups = _load_group_category_master(master_categories_file)
+
+    # Load description -> (group, category) rules.
     rules = _load_category_rules(categories_file)
 
+    # Row-level stats
+    total_rows = 0
     auto_assigned = 0
     already_categorized = 0
     uncategorized = 0
 
+    # Rule-level stats
+    new_rules = 0
+    rules_skipped_invalid_pair = 0
+    rules_skipped_conflict = 0
+
     updated_rows: list[dict[str, str]] = []
+    row_statuses: list[TxStatus] = []
 
     for idx, row in enumerate(rows, start=1):
+        total_rows += 1
+
         desc = (row.get("description") or "").strip()
         grp = (row.get("group") or "").strip()
         cat = (row.get("category") or "").strip()
 
+        # Default status: assume unassigned until we know otherwise.
+        status = TxStatus.UNASSIGNED
+
+        # --- Row-level group/category consistency checks ---
         if cat and not grp:
             print(f"[CATEGORIZE] Warning: row {idx} has category={cat!r} but no group.")
         if grp and not cat:
             print(f"[CATEGORIZE] Warning: row {idx} has group={grp!r} but no category.")
+
+        # Check validity of (group, category) if both are present
+        pair_is_valid = False
         if grp and cat:
             valid_cats = group_to_categories.get(grp, set())
             if cat not in valid_cats:
                 print(
                     f"[CATEGORIZE] Warning: row {idx} has (group, category)=({grp!r}, {cat!r}) "
-                    "which does not exist in master categories."
+                    "which does not exist in master categories. This pair will NOT be turned "
+                    "into a rule."
                 )
+            else:
+                pair_is_valid = True
+                status = TxStatus.MANUAL  # valid pair present from the CSV
 
+        # If no description, we can't do any rule-based work; keep row as-is.
         if not desc:
+            if grp and cat and pair_is_valid:
+                already_categorized += 1
+            else:
+                uncategorized += 1
             updated_rows.append(row)
+            row_statuses.append(status)
             continue
 
+        # --- Description-based rules logic ---
         if grp and cat:
-            rule_pair = (grp, cat)
-            if rules.get(desc) != rule_pair:
-                rules[desc] = rule_pair
-            already_categorized += 1
+            # Fully specified pair on this row.
+            if pair_is_valid:
+                already_categorized += 1
+            else:
+                uncategorized += 1  # invalid pair counts as not properly categorized
+
+            if not pair_is_valid:
+                # Invalid pairs never become rules.
+                rules_skipped_invalid_pair += 1
+            else:
+                existing = rules.get(desc)
+                if existing is None:
+                    # New rule
+                    rules[desc] = (grp, cat)
+                    new_rules += 1
+                elif existing == (grp, cat):
+                    # Matches existing rule: nothing to change.
+                    pass
+                else:
+                    # Conflict: keep existing rule, warn.
+                    rules_skipped_conflict += 1
+                    rule_grp, rule_cat = existing
+                    print(
+                        f"[CATEGORIZE] Warning: row {idx} has (group, category)=({grp!r}, {cat!r}) "
+                        f"but the rules file already has ({rule_grp!r}, {rule_cat!r}) for "
+                        f"description={desc!r}. Keeping the existing rule."
+                    )
+
         elif not grp and not cat:
+            # Nothing assigned yet: try to apply a rule from description.
             rule_pair = rules.get(desc)
             if rule_pair:
                 rule_grp, rule_cat = rule_pair
                 row["group"] = rule_grp
                 row["category"] = rule_cat
                 auto_assigned += 1
+                status = TxStatus.AUTO_PENDING
             else:
                 uncategorized += 1
+                status = TxStatus.UNASSIGNED
         else:
+            # Partial (grp xor cat): we've already warned above.
             uncategorized += 1
+            status = TxStatus.UNASSIGNED
 
         updated_rows.append(row)
+        row_statuses.append(status)
 
+    # Write updated transactions back to the same CSV.
     with input_csv.open("w", newline="", encoding="utf-8") as f_out:
         writer = csv.DictWriter(f_out, fieldnames=fieldnames)
         writer.writeheader()
         for row in updated_rows:
             writer.writerow(row)
 
+    # Persist updated description -> (group, category) rules.
     _save_category_rules(categories_file, rules)
 
-    print("[CATEGORIZE] Done.")
+    # Summary
+    print("[CATEGORIZE] Summary")
+    print(f"[CATEGORIZE] Total rows processed           : {total_rows}")
     print(f"[CATEGORIZE] Already fully categorized rows : {already_categorized}")
     print(f"[CATEGORIZE] Auto-assigned via rules       : {auto_assigned}")
-    print(f"[CATEGORIZE] Still uncategorized/partial   : {uncategorized}")
+    print(f"[CATEGORIZE] Still blank / partial         : {uncategorized}")
+    print("[CATEGORIZE] Rules")
+    print(f"[CATEGORIZE] New rules created             : {new_rules}")
+    print(f"[CATEGORIZE] Rules skipped (invalid pair)  : {rules_skipped_invalid_pair}")
+    print(f"[CATEGORIZE] Rules skipped (conflict)      : {rules_skipped_conflict}")
     print(f"[CATEGORIZE] Rules saved to                : {categories_file}")
 
+    # UI preview page (non-interactive)
+    print("\n[CATEGORIZE] Rendering one-page console UI preview (non-interactive)...")
+    _preview_ui_page(updated_rows, row_statuses, group_to_categories, max_rows=10)
 
 def check(input_csv: Path, categories_file: Path, master_categories_file: Path) -> None:
     """Validate transactions, master categories, and rules without modifying anything."""
@@ -342,12 +562,13 @@ def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
 
     report_file.parent.mkdir(parents=True, exist_ok=True)
     with report_file.open("w", encoding="utf-8") as f_out:
-        f_out.write(f"Report for: {input_csv}")
-        f_out.write(f"Categories file: {categories_file}")
-        f_out.write(f"Total rows: {total_rows}")
-        f_out.write("Category, Count, Total Amount")
+        f_out.write(f"Report for: {input_csv}\n")
+        f_out.write(f"Total rows: {total_rows}\n")
+        f_out.write("Category, Count, Total Amount\n")
         for category in sorted(totals):
-            f_out.write(f"{category}, {counts[category]}, {totals[category]:.2f}")
+            f_out.write(f"{category}, {counts[category]}, {totals[category]:.2f}\n")
+
+
 
     print("[EXPORT] Report written to:", report_file)
 
