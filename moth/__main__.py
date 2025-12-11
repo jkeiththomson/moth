@@ -27,84 +27,201 @@ def extract(input_pdf: Path, output_csv: Path) -> None:
     print(f"[EXTRACT] Would read PDF: {input_pdf}")
     print(f"[EXTRACT] Would write CSV: {output_csv}")
     print("[EXTRACT] Would also compute deposits/withdrawals and totals.")
-    print("[EXTRACT] CSV schema would include: "
-          "statement_date, date, description, amount, category")
+    print(
+        "[EXTRACT] CSV schema would include: "
+        "statement_date, date, description, amount, group, category"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Category persistence helpers
+# Group / category master (read-only)
 # ---------------------------------------------------------------------------
 
 
-def _load_category_map(categories_file: Path) -> dict[str, str]:
-    """Load a description→category mapping from a CSV file, if it exists.
-
-    The expected format is:
-
-        description,category
-        "SAFEWAY",Groceries
-        "CHEVRON",Fuel
+def _load_group_category_master() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """
-    mapping: dict[str, str] = {}
+    Load and validate the master group/category mapping from data/categories.csv.
+
+    Rules enforced:
+
+    - Each (group, category) pair must be unique.
+    - A category name is allowed to appear in multiple groups.
+    - Groups with no valid categories are ignored.
+    - Rows with missing group or category are skipped.
+
+    The file is treated as read-only for now.
+
+    Returns:
+        group_to_categories: {group -> set of categories}
+        category_to_groups: {category -> set of groups}
+    """
+    from pathlib import Path as _Path
+    import csv as _csv
+
+    master_path = _Path(__file__).resolve().parent.parent / "data" / "categories.csv"
+
+    group_to_categories: dict[str, set[str]] = {}
+    category_to_groups: dict[str, set[str]] = {}
+
+    if not master_path.exists():
+        print("[GROUPS] Warning: master categories file not found:", master_path)
+        return group_to_categories, category_to_groups
+
+    seen_pairs: set[tuple[str, str]] = set()
+
+    with master_path.open(newline="", encoding="utf-8") as f:
+        reader = _csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+
+        group_field = None
+        category_field = None
+        for name in fieldnames:
+            lname = name.lower()
+            if lname == "group":
+                group_field = name
+            elif lname == "category":
+                category_field = name
+
+        if not group_field or not category_field:
+            print(
+                "[GROUPS] ERROR: categories.csv must have 'group' and 'category' columns."
+            )
+            return group_to_categories, category_to_groups
+
+        for row in reader:
+            raw_group = (row.get(group_field) or "").strip()
+            raw_cat = (row.get(category_field) or "").strip()
+
+            if not raw_group and not raw_cat:
+                continue  # completely empty row
+            if not raw_group or not raw_cat:
+                print(
+                    f"[GROUPS] Warning: skipping row with missing data: "
+                    f"group={raw_group!r}, category={raw_cat!r}"
+                )
+                continue
+
+            pair = (raw_group, raw_cat)
+            if pair in seen_pairs:
+                print(
+                    "[GROUPS] Warning: duplicate (group, category) pair found; "
+                    f"ignoring: group={raw_group!r}, category={raw_cat!r}"
+                )
+                continue
+            seen_pairs.add(pair)
+
+            group_to_categories.setdefault(raw_group, set()).add(raw_cat)
+            category_to_groups.setdefault(raw_cat, set()).add(raw_group)
+
+    # Remove any groups that ended up with no categories (just in case)
+    empty_groups = [g for g, cats in group_to_categories.items() if not cats]
+    for g in empty_groups:
+        print(f"[GROUPS] Warning: dropping empty group: {g!r}")
+        group_to_categories.pop(g, None)
+
+    print("[GROUPS] Loaded master categories from:", master_path)
+    print(f"[GROUPS] Groups: {len(group_to_categories)}")
+    print(f"[GROUPS] Categories (unique names): {len(category_to_groups)}")
+
+    return group_to_categories, category_to_groups
+
+
+# ---------------------------------------------------------------------------
+# Category rule persistence: description → (group, category)
+# ---------------------------------------------------------------------------
+
+
+def _load_category_rules(
+    categories_file: Path,
+) -> dict[str, tuple[str, str]]:
+    """
+    Load a description→(group, category) mapping from a CSV rules file, if it exists.
+
+    Expected format:
+
+        description,group,category
+        "SAFEWAY",Household,Groceries
+        "CHEVRON",Transport,Fuel
+
+    If the file is missing or malformed, an empty mapping is returned.
+    """
+    rules: dict[str, tuple[str, str]] = {}
     if not categories_file.exists():
-        return mapping
+        return rules
 
     with categories_file.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
-        if "description" not in fieldnames or "category" not in fieldnames:
+
+        desc_field = None
+        group_field = None
+        category_field = None
+        for name in fieldnames:
+            lname = name.lower()
+            if lname == "description":
+                desc_field = name
+            elif lname == "group":
+                group_field = name
+            elif lname == "category":
+                category_field = name
+
+        if not desc_field or not group_field or not category_field:
             print(
                 f"[CATEGORIZE] Warning: {categories_file} does not have "
-                "'description' and 'category' columns; ignoring existing data."
+                "'description', 'group', and 'category' columns; ignoring existing rules."
             )
-            return mapping
+            return rules
 
         for row in reader:
-            desc = (row.get("description") or "").strip()
-            cat = (row.get("category") or "").strip()
-            if desc and cat:
-                mapping[desc] = cat
+            desc = (row.get(desc_field) or "").strip()
+            grp = (row.get(group_field) or "").strip()
+            cat = (row.get(category_field) or "").strip()
+            if desc and grp and cat:
+                rules[desc] = (grp, cat)
 
-    return mapping
+    return rules
 
 
-def _save_category_map(categories_file: Path, mapping: dict[str, str]) -> None:
-    """Persist the description→category mapping to a CSV file."""
+def _save_category_rules(
+    categories_file: Path,
+    rules: dict[str, tuple[str, str]],
+) -> None:
+    """Persist the description→(group, category) mapping to a CSV file."""
     categories_file.parent.mkdir(parents=True, exist_ok=True)
     with categories_file.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["description", "category"])
-        for desc in sorted(mapping):
-            writer.writerow([desc, mapping[desc]])
+        writer.writerow(["description", "group", "category"])
+        for desc in sorted(rules):
+            grp, cat = rules[desc]
+            writer.writerow([desc, grp, cat])
 
 
 # ---------------------------------------------------------------------------
-# Categorize: persistent category system with statement_date support
+# Categorize: persistent (group, category) system with statement_date support
 # ---------------------------------------------------------------------------
 
 
 def categorize(input_csv: Path, categories_file: Path) -> None:
-    """Assign categories to each transaction and persist the rules.
+    """
+    Assign (group, category) to each transaction and persist description-based rules.
 
-    Simple rule-based persistent category system:
+    Behavior:
 
     - Transactions are read from ``input_csv`` (a CSV file).
-    - Categories are stored in ``categories_file`` as description→category rules.
+    - Rules are stored in ``categories_file`` as description→(group, category).
     - For each row:
-      * If ``category`` is already set, that value is kept and the rule
-        is stored/updated in ``categories_file``.
-      * If ``category`` is empty but we have a rule for this description,
-        the category is filled in from the rule.
-      * If there is no rule and no category, the category is left blank.
+      * If both ``group`` and ``category`` are set:
+          - We validate (group, category) against the master categories.
+          - We learn/update the rule for this description.
+      * If both ``group`` and ``category`` are empty:
+          - We look up the description in the rules and, if found,
+            assign both group and category to the row.
+      * If one is set and the other is empty:
+          - We warn, but do not auto-fix yet.
 
     Required columns in ``input_csv``:
 
-        statement_date, date, description, amount
-
-    Effect:
-    - Category assignments survive quitting and restarting the app.
-    - Editing categories directly in the CSV and re-running ``categorize``
-      will update the persistent rule set.
+        statement_date, date, description, amount, group, category
     """
 
     if not input_csv.exists():
@@ -116,7 +233,14 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
         fieldnames = reader.fieldnames or []
         rows = list(reader)
 
-    required_cols = ["statement_date", "date", "description", "amount"]
+    required_cols = [
+        "statement_date",
+        "date",
+        "description",
+        "amount",
+        "group",
+        "category",
+    ]
     missing = [c for c in required_cols if c not in fieldnames]
 
     if missing:
@@ -127,10 +251,11 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
         print("[CATEGORIZE] Missing:", ", ".join(missing))
         return
 
-    if "category" not in fieldnames:
-        fieldnames.append("category")
+    # Load master (group, category) universe (read-only).
+    group_to_categories, category_to_groups = _load_group_category_master()
 
-    category_map = _load_category_map(categories_file)
+    # Load description → (group, category) rules.
+    rules = _load_category_rules(categories_file)
 
     auto_assigned = 0
     already_categorized = 0
@@ -138,27 +263,62 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
 
     updated_rows: list[dict[str, str]] = []
 
+    row_index = 0
     for row in rows:
+        row_index += 1
         desc = (row.get("description") or "").strip()
+        grp = (row.get("group") or "").strip()
         cat = (row.get("category") or "").strip()
+
+        # --- Row-level group/category consistency checks ---
+
+        if cat and not grp:
+            print(
+                f"[CATEGORIZE] Warning: row {row_index} has category={cat!r} "
+                "but no group; this is probably unintended."
+            )
+
+        if grp and not cat:
+            print(
+                f"[CATEGORIZE] Warning: row {row_index} has group={grp!r} "
+                "but no category; this is probably unintended."
+            )
+
+        if grp and cat:
+            # Validate against master (group, category) universe.
+            valid_cats = group_to_categories.get(grp, set())
+            if cat not in valid_cats:
+                print(
+                    f"[CATEGORIZE] Warning: row {row_index} has (group, category)="
+                    f"({grp!r}, {cat!r}) which does not exist in master categories."
+                )
+
+        # --- Description-based rules logic ---
 
         if not desc:
             updated_rows.append(row)
             continue
 
-        if cat:
-            # Row already has a category; learn or update the rule.
-            if category_map.get(desc) != cat:
-                category_map[desc] = cat
+        if grp and cat:
+            # Fully specified pair; learn/update rule.
+            rule_pair = (grp, cat)
+            if rules.get(desc) != rule_pair:
+                rules[desc] = rule_pair
             already_categorized += 1
-        else:
-            # No category yet; try to apply a rule.
-            rule_cat = category_map.get(desc)
-            if rule_cat:
+        elif not grp and not cat:
+            # Nothing assigned yet: try to apply a rule from description.
+            rule_pair = rules.get(desc)
+            if rule_pair:
+                rule_grp, rule_cat = rule_pair
+                row["group"] = rule_grp
                 row["category"] = rule_cat
+                grp, cat = rule_grp, rule_cat
                 auto_assigned += 1
             else:
                 uncategorized += 1
+        else:
+            # Partial (grp xor cat): we've already warned above.
+            uncategorized += 1
 
         updated_rows.append(row)
 
@@ -169,23 +329,24 @@ def categorize(input_csv: Path, categories_file: Path) -> None:
         for row in updated_rows:
             writer.writerow(row)
 
-    # Persist updated category rules.
-    _save_category_map(categories_file, category_map)
+    # Persist updated description→(group, category) rules.
+    _save_category_rules(categories_file, rules)
 
     print("[CATEGORIZE] Done.")
-    print(f"[CATEGORIZE] Already categorized rows : {already_categorized}")
-    print(f"[CATEGORIZE] Auto-assigned via rules : {auto_assigned}")
-    print(f"[CATEGORIZE] Still uncategorized     : {uncategorized}")
-    print(f"[CATEGORIZE] Rules saved to          : {categories_file}")
+    print(f"[CATEGORIZE] Already fully categorized rows : {already_categorized}")
+    print(f"[CATEGORIZE] Auto-assigned via rules       : {auto_assigned}")
+    print(f"[CATEGORIZE] Still uncategorized/partial   : {uncategorized}")
+    print(f"[CATEGORIZE] Rules saved to                : {categories_file}")
 
 
 # ---------------------------------------------------------------------------
-# Export: simple summary report
+# Export: simple summary report (still category-based for now)
 # ---------------------------------------------------------------------------
 
 
 def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
-    """Export a simple text report based on the categorized CSV.
+    """
+    Export a simple text report based on the categorized CSV.
 
     Current behavior:
 
@@ -195,7 +356,7 @@ def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
         * total amount (sum of 'amount')
     - Writes a plain-text report to ``report_file`` summarizing these totals.
 
-    ``statement_date`` is preserved in the CSV but not yet used for grouping.
+    Note: for now, this groups only by category, not by (group, category).
     """
 
     if not input_csv.exists():
@@ -251,7 +412,8 @@ def export(input_csv: Path, categories_file: Path, report_file: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Meta function that exposes the three commands:
+    """
+    Meta function that exposes the three commands:
 
     - extract
     - categorize
@@ -278,7 +440,7 @@ def main(argv: list[str] | None = None) -> None:
     # categorize
     p_categorize = subparsers.add_parser(
         "categorize",
-        help="Assign categories to transactions and persist rules.",
+        help="Assign (group, category) to transactions and persist rules.",
     )
     p_categorize.add_argument(
         "input_csv",
@@ -286,7 +448,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_categorize.add_argument(
         "categories_file",
-        help="Path to category storage file (persists across runs).",
+        help="Path to category rules file (persists across runs).",
     )
 
     # export
@@ -300,7 +462,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_export.add_argument(
         "categories_file",
-        help="Path to category storage file (same as used for categorize).",
+        help="Path to category rules file (same as used for categorize).",
     )
     p_export.add_argument(
         "report_file",
