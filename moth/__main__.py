@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import csv
-
+from .extractors import extract_chase_activity
 
 # ---------------------------------------------------------------------------
 # Core functions
@@ -13,26 +13,26 @@ import csv
 
 def extract(input_pdf: Path, output_csv: Path) -> None:
     """
-    Stub: extract transactions from a statement PDF into a CSV.
+    Extract transactions from a statement PDF into a CSV.
 
-    Expected behavior (later, when implemented):
+    For now, this is implemented as a Chase-only extractor using the
+    old Monarch-style logic (pdfplumber + regex on date lines).
 
-    - Read the bank/credit-card statement PDF.
-    - Parse every transaction (statement_date, date, description, amount).
-    - Write a flat CSV file with one transaction per row.
-    - Count deposits and withdrawals and sum their amounts.
+    Output CSV schema:
 
-    For now, this function only prints what it *would* do.
+        statement_date,date,description,amount,group,category
     """
-    print("[EXTRACT] stub running...")
-    print(f"[EXTRACT] Would read PDF: {input_pdf}")
-    print(f"[EXTRACT] Would write CSV: {output_csv}")
-    print("[EXTRACT] Would also compute deposits/withdrawals and totals.")
-    print(
-        "[EXTRACT] CSV schema would include: "
-        "statement_date, date, description, amount, group, category"
-    )
-
+    print("[EXTRACT] Using Chase-style extractor (Monarch-derived).")
+    extract_chase_activity(input_pdf, output_csv)
+    # print(f"[EXTRACT] stub running...")
+    # print(f"[EXTRACT] Would read PDF: {input_pdf}")
+    # print(f"[EXTRACT] Would write CSV: {output_csv}")
+    # print("[EXTRACT] Would also compute deposits/withdrawals and totals.")
+    # print(
+    #     "[EXTRACT] CSV schema would include: "
+    #     "statement_date, date, description, amount, group, category"
+    # )
+    #
 
 # ---------------------------------------------------------------------------
 # Group / category master (read-only)
